@@ -1,0 +1,726 @@
+#!/bin/bash
+# description: izPing is a multihomed internet links tester, failover and recovery for network balanced setups
+# chkconfig: 35 99 9
+#
+# written by Ugo Viti <ugo.viti@initzero.it>
+# please visit http://www.initzero.it for commercial support
+# For README, HowTo, ChangeLog, Contributors and License go to the end of this script
+VERSION="1.6"
+VERSION_DATE="20140819"
+
+izping_run() {
+##########################################################################
+# begin user variables
+
+# example of GATEWAY variable contents
+#GATEWAYS="eth1:192.168.56.3:internet1 eth2:192.168.57.3:internet2"
+
+# ip address or hostname to ping to understand when a line is down (use spaces to separe the gateway to use, and comma to specify multiple target for every gateway)
+#VERIFY_HOSTS="8.8.8.8,www.initzero.it 8.8.4.4,www.google.com"
+VERIFY_HOSTS="8.8.8.8"
+
+# ip address or hostname to ping when a line is in a down state to known when make a recovery. separe with spaces to associate the failover host to the respective gateway order
+# ex. use the point-to-point router address
+FAILOVER_HOSTS="8.8.4.4"
+
+# mail address where send notifications
+MAILTO="root@localhost.localdomain"
+# end user variables
+##########################################################################
+
+
+###########################################################################################
+# begin user failover/recovery functions, customize as you need
+
+# special system variables usable here:
+# $FOID		FailOver ID to reference the next usable interface ID in round robin fashion
+
+user_failover() {
+  # obtain the line number of the iptables rule to change
+  local RULENUM="$(iptables -L ${GWNM[$ID]} -v -n -t mangle --line-numbers | tail -n 2 | head -n 1 | awk '{print $1}')"
+
+  set -x 
+
+  # iptables mangle management (this command is usable only with izbalancing running)
+  iptables -t mangle -R ${GWNM[$ID]} ${RULENUM} -m mark --mark 0 -j MARK --set-mark $FOID
+  conntrack -F
+  set +x
+
+  manual_gateway_failover() {
+  # manual failover based on current interface id
+  case ${GWTB[$ID]} in
+	1)
+		report_text log "Executing command: ip route replace default via ${GWIP[2]}"
+		ip route replace default via ${GWIP[2]}
+	;;	
+	2)
+		report_text log "Executing command: ip route replace default via ${GWIP[1]}"
+		ip route replace default via ${GWIP[1]}
+	;;
+  esac
+  }
+  #manual_gateway_failover
+
+  # default gateway replacement (not prefered mode)
+  #ip route replace default via ${GWIP[$FOID]}
+}
+
+
+user_recovery() {
+  # obtain the line number of the iptables rule to change
+  local RULENUM="$(iptables -L ${GWNM[$ID]} -v -n -t mangle --line-numbers | tail -n 2 | head -n 1 | awk '{print $1}')"
+
+  set -x
+
+  # iptables mangle management (this command is usable only with izbalancing running)
+  iptables -t mangle -R ${GWNM[$ID]} ${RULENUM} -m mark --mark 0 -j MARK --set-mark ${GWTB[$ID]}
+  conntrack -F
+
+  set +x
+
+  # default gateway replacement (not prefered mode)
+  #ip route replace default via ${GWIP[$ID]}
+}
+# end user failover/recovery functions
+###########################################################################################
+
+
+#######################################################
+#######################################################
+## CONFIGURATION IS OVER, DON'T EDIT ANYTHING BELLOW ##
+#######################################################
+#######################################################
+
+
+##########################################################################
+# begin script variables
+NAME="izping"
+DESCRIPTION="multihomed links tester for network balanced setups"
+
+# 0=run izping in foreground, 1=run izping in background 
+DAEMON="0"
+DAEMON_RESTART="0"
+DAEMON_KILL="0"
+
+# enable debug
+DEBUG=0
+
+# time between checks in seconds
+SLEEP_TIME=10
+
+# ping timeout in seconds
+PING_TIMEOUT=3
+
+# number of repeats of success before changing status of connection
+SUCCESS_CNT=10
+
+# number of repeats of failures before changing status of connection
+ERROR_CNT=5
+
+# number of repeats before retring to ping the host after a failover
+FAILOVER_CNT=10
+
+# number of repeats before sending a mail
+MAIL_CNT=2
+
+# save the hostname
+HOSTNAME="$(hostname)"
+
+# default log destination
+LOG="~/izping.log"
+# end script variables
+###########################################################################################
+
+
+report_text(){
+	local TYPE=$1
+	shift
+	local ARGS=$@
+
+	case $TYPE in
+                log) echo -e -n "$(date +"%Y-%m-%d %H:%M:%S") TRY:[$TRY] GWID:[${GWTB[${ID}]}] GWNM:[${GWNM[${ID}]}] GWIF:[${GWIF[${ID}]}] GWIFIP:[${GWIFIP[${ID}]}] GWIP:[${GWIP[${ID}]}] CLS:[${CLS[${ID}]}] LLS:[${LLS[${ID}]}] CPS:[${CPS[${ID}]}] LPS:[${LPS[${ID}]}] CNT:[${CNT[${ID}]}/${ERROR_CNT}/${FAILOVER_CNT}/${SUCCESS_CNT}] CHECK:[${HOST}] STATUS:[$ARGS]\n" ;;
+                error_interface_noipaddress) echo "ERROR: the interface ${GWIF[${ID}]} has no IP address associated. exiting" ;;
+                warning_cps) echo "WARNING: changed current ping status (CPS) for ${GWIF[${ID}]} from ${LPS[$ID]} to ${CPS[$ID]}" ;;
+                warning_cls) echo "WARNING: changed current link status (CLS) for ${GWIF[${ID}]} from ${LLS[$ID]} to ${CLS[$ID]}" ;;
+                failover) echo "WARNING: FAILOVER for ${GWIF[${ID}]} from ${GWNM[${ID}]} ID:${GWTB[${ID}]} to ${GWNM[${FOID}]} ID:$FOID" ;;
+                recovery) echo "INFO: RECOVERY for ${GWIF[${ID}]} from ${GWNM[${FOID}]} ID:$FOID to ${GWNM[${ID}]} ID:${GWTB[${ID}]}" ;;
+                report_email) echo "INFO: sending mail report for ${GWNM[${ID}]} ID:${GWTB[${ID}]} to $MAILTO" ;;
+                verify_host_up) echo "UP" ;;
+                verify_host_down) echo "WARNING: verify host ${HOST} is DOWN" ;;
+                failover_host_down) echo "WARNING: failover host ${HOST} is DOWN" ;;
+                failover_host_up) echo "INFO: failover host ${HOST} is UP" ;;
+                email_subject) echo "[$NAME] server:[$HOSTNAME] message:[$ARGS]" ;;
+	esac
+}
+
+izping_main() {
+        echo "$(date +"%Y-%m-%d %H:%M:%S") INFO: starting $(basename $0) v$VERSION-$VERSION_DATE with command line: $command $command_args"
+	izping_init
+	izping_daemon
+}
+
+# do not change anything below this line
+izping_init() {
+  PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin:/usr/local/sbin:/root/bin
+  ID=1
+  for GW in $GATEWAYS
+    do
+        local GWIF_LOCAL="$(echo $GW | awk -F":" '{print $1}')"
+        local GWIP_LOCAL="$(echo $GW | awk -F":" '{print $2}')"
+        local GWNM_LOCAL="$(echo $GW | awk -F":" '{print $3}')"
+
+	# put default variables into an array
+        GWTB[$ID]="$ID"                 # gateway table id
+	GWIF[$ID]="$GWIF_LOCAL"		# ethernet interface
+	GWIP[$ID]="$GWIP_LOCAL"		# interface default gateway
+	GWNM[$ID]="$GWNM_LOCAL"		# gateway interface description
+	GWIFIP[$ID]="$(find_primary_ip ${GWIF[$ID]})" # interface ip
+
+	[ -z ${GWIP[$ID]} ] && GWIP[$ID]="$(find_default_gateway ${GWIF[$ID]})" # obtain default gateway ip if not specified
+
+	LLS[$ID]=0 # Last Link Status (0=up 1=down) (default: 0)
+	LPS[$ID]=0 # Last Ping Status (0=up 1=down) (default: 0)
+	CPS[$ID]=0 # Current Ping Status (0=up 1=down) (default: 0)
+	CLS[$ID]=0 # Current Link Status: indicates that the link needs to be changed (0=no need change 1=need change) (default: 0)
+	CNT[$ID]=1 # Count of repeated up status or down status (default: 1)
+	FO[$ID]=$ID # Failover ID, this variable contains the current table ID used as failover domain
+	FOCNT[$ID]=1 # Failover counter
+
+	# show debugs messages if required
+	[ "$DEBUG" -ne 0 ] && izping_show_debug
+
+	[ -z ${GWIFIP[$ID]} ] && report_text error_interface_noipaddress && exit 1
+
+	let ID+=1
+    done
+  # get number of elements in the array
+  GW_TOT=${#GWTB[@]}
+
+  # assign every entry in host to check to respective interface
+  HID=1
+  for VERIFY_HOST in $VERIFY_HOSTS
+    do
+       VHOST[$HID]="$(echo $VERIFY_HOST | sed 's/,/ /g')"
+       #echo ${HOST[$HID]}
+       let HID+=1
+    done
+  # get number of elements in the array
+  VHOSTS_TOT=${#VHOST[@]}
+
+  # assign every entry in failover host to check to respective interface
+  FID=1
+  for FAILOVER_HOST in $FAILOVER_HOSTS
+    do
+       FHOST[$FID]="$(echo $FAILOVER_HOST | sed 's/,/ /g')"
+       #echo ${HOST[$HID]}
+       let FID+=1
+    done
+  # get number of elements in the array
+  FHOSTS_TOT=${#FHOST[@]}
+
+}
+
+izping_daemon() {
+TRY=1
+while true ; do
+  for ((ID=1;ID<=$GW_TOT;ID++)); do
+
+	# if there is only a host to check, then use that host for every gateway
+	[ -z "${VHOST[$ID]}" ] && VHOST[$ID]=${HOST[1]}
+	[ -z "${FHOST[$ID]}" ] && FHOST[$ID]=${HOST[1]}
+
+
+	# if the failover statu 0 (the line is up), then verify the standard hosts, else verify the failover hosts
+	  for HOST in ${VHOST[$ID]}
+	   do
+	    #set -x
+	    #echo $HOST
+            #ping -W $PING_TIMEOUT -I ${GWNM[${ID}]} -c 1 $HOST >/dev/null 2>&1
+            ping -W $PING_TIMEOUT -I ${GWIFIP[${ID}]} -c 3 $HOST >/dev/null 2>&1
+            [ $? = 0 ] && RETVAL=0
+	    #set +x
+	   done
+
+
+	# if no any ping test success then assume global unreachable status
+        [ -z $RETVAL ] && RETVAL=1
+
+        # set as down if the ping test fail
+        if [ $RETVAL -ne 0 ]
+          then
+		report_text log	"$(report_text verify_host_down)"
+                CPS[$ID]=1
+	  else
+	        # display the current OK status if DEBUG is enabled
+                [ $DEBUG -ne 0 ] && report_text log "$(report_text verify_host_up)"
+                CPS[$ID]=0
+                CLS[$ID]=0
+        fi
+
+	# unset the last ping status return code
+	unset RETVAL
+
+
+	# if the last ping status differ from current ping status, display the warning and reset the ping counter
+        if   [ ${LPS[$ID]} -ne ${CPS[$ID]} ]
+          then
+		report_text log	"$(report_text warning_cps)"
+                CNT[$ID]=1
+	# if the last ping status differ from last line status, then increase the check counter
+        elif [[ (${LLS[$ID]} -eq 0) && (${LPS[$ID]} -ne ${LLS[$ID]}) ]]
+          then
+                let CNT[$ID]+=1
+	# if the current ping status is up and the ping counter differ from retry count, then increase counter, else reset the counter
+	elif [[ (${CPS[$ID]} -eq 0) || (${CNT[$ID]} -gt ${FAILOVER_CNT}) ]]
+	  then
+		CNT[$ID]=1
+	  else
+                let CNT[$ID]+=1
+        fi
+
+	#####
+	## failover and recovery management
+
+	# ping failover hosts
+	if [[ ${LLS[$ID]} -eq 1 && ${CLS[$ID]} -eq 0 ]]
+	 then
+	  for HOST in ${FHOST[$ID]}
+	   do
+            ping -W $PING_TIMEOUT -I ${GWIFIP[${ID}]} -c 3 $HOST >/dev/null 2>&1
+            [ $? = 0 ] && RETVAL=0
+	   done
+	# if no any ping test success then assume global unreachable status
+        [ -z $RETVAL ] && RETVAL=1
+
+        # set as down if the ping test fail
+        if [ $RETVAL -ne 0 ]
+          then
+		let FOCNT[$ID]=1
+		report_text log	"$(report_text failover_host_down)"
+	  else
+		let FOCNT[$ID]+=1
+		let CNT[$ID]=${FOCNT[$ID]}
+                report_text log "$(report_text failover_host_up)"
+		#echo CNT=${CNT[$ID]}
+		#echo FOCNT=${FOCNT[$ID]}
+        fi
+
+	# unset the last ping status return code
+	unset RETVAL
+
+	# if the failover host is reachable then reset the last line status
+	[ ${FOCNT[$ID]} -gt ${SUCCESS_CNT} ] && LLS[$ID]=0
+	
+	fi
+
+
+        # if the last line status is 0 and the current line status is 0 and the ping counter reach the failures counter, then exec the failover
+	if   [[ ${CPS[$ID]} -eq 1 && ${LLS[$ID]} -eq 0 && ${CLS[$ID]} -eq 0 && ${CNT[$ID]} -gt $ERROR_CNT ]]
+	  then
+		# set current line status to 1
+		CLS[$ID]=1
+                let CNT[$ID]-=1
+		report_text log	"$(report_text warning_cls)"
+                izping_failover
+		CNT[$ID]=1
+                LLS[$ID]=1
+        # if the last line status is 1 and the current line status is 1 and the ping counter reach the failover counter, then retry the failover
+	elif [[ ${LLS[$ID]} -eq 1 && ${CLS[$ID]} -eq 1 && ${CNT[$ID]} -gt $FAILOVER_CNT ]]
+	  then
+                let CNT[$ID]-=1
+                izping_failover
+		CNT[$ID]=1
+        # if the last line status is 1 and the last ping status is 0 and the ping counter reach the success counter, then exec the recovery
+        elif [[ ${LLS[$ID]} -eq 0 && ${CLS[$ID]} -eq 0 && ${CNT[$ID]} -gt $SUCCESS_CNT ]]
+	  then
+		# set current line status to 0
+		CLS[$ID]=0
+                let CNT[$ID]-=1
+		report_text log	"$(report_text warning_cls)"
+		izping_recovery
+		CNT[$ID]=1
+                LLS[$ID]=0
+	fi
+
+
+        # save current ping status into last ping status
+        LPS[$ID]=${CPS[$ID]}
+
+    done
+
+  sleep $SLEEP_TIME
+  let TRY+=1
+done
+}
+
+
+izping_failover() {
+        # round robin failover, try every way to find a solution
+        [ ${FO[$ID]=$ID} -lt $GW_TOT ] && let FO[$ID]+=1 || FO[$ID]=1 ; FOID=${FO[$ID]}
+
+	report_text log "$(report_text failover)"
+	report_text log "$(report_text report_email)"
+	report_email " $(report_text failover)"
+
+	user_failover
+}
+
+
+izping_recovery() {
+	report_text log "$(report_text recovery)"
+	report_text log "$(report_text report_email)"
+	report_email " $(report_text recovery)"
+
+	user_recovery
+}
+
+
+status_daemon() {
+	PID="$(pidofproc $0)"
+        if [ -n "$PID" ]
+          then
+            echo "INFO: $(basename $0) daemon is already running with pid ($PID)"
+        fi
+}
+
+
+
+start_daemon() {
+	status_daemon
+        if [ -z "$PID" ]
+          then
+	    #echo running in background mode
+            izping_main >>$LOG 2>&1 &
+          else
+            exit 0;
+        fi
+}
+
+
+kill_daemon() {
+	PID="$(pidofproc $0)"
+        if [ -z "$PID" ]
+          then
+            echo "INFO: the $(basename $0) daemon is not running right now"
+          else
+            for LPID in $PID ; do kill $PID; done
+            echo "$(date +"%Y-%m-%d %H:%M:%S") INFO: stopping $(basename $0) daemon running with pid ($PID)" 2>&1 | tee -a $LOG
+        fi
+}
+
+find_primary_ip() {
+  if [ -n $1 ]
+    then
+      echo $(ip addr show $1 | grep 'inet' | grep -v ":" | awk '{print $2}' | head -n1 | sed -e 's/\/.*//')
+  fi
+}
+
+
+find_default_gateway() {
+  if [ -n $1 ]
+    then
+      echo $(ip route show default | grep ^"default" | awk '{print $3}')
+  fi
+}
+
+
+report_email() {
+  report_text log $@ | mail -s "$(report_text email_subject $@)" ${MAILTO}
+}
+
+
+
+izping_show_debug() {
+  echo "=================== DEBUG ====================="
+  echo "  GWIF[$ID]=${GWIF[$ID]}	# Interface"
+  echo "  GWNM[$ID]=${GWNM[$ID]}	# Interface Name"
+  echo "GWIFIP[$ID]=${GWIFIP[$ID]}	# Interface IP"
+  echo "  GWIP[$ID]=${GWIP[$ID]}	# Gateway IP"
+  echo "   LLS[$ID]=${LLS[$ID]}		# Last Link Status (0=up 1=down)"
+  echo "   LPS[$ID]=${LPS[$ID]}		# Last Ping Status (0=up 1=down)"
+  echo "   CPS[$ID]=${CPS[$ID]}		# Current Ping Status (0=up 1=down)"
+  echo "   CLS[$ID]=${CLS[$ID]}		# Current Link Status: indicates that the link needs to be changed (0=not need change 1=need change)"
+  echo "   CNT[$ID]=${CNT[$ID]}		# Count of repeated up status or down status"
+  echo "-----------------------------------------------"
+}
+
+
+# __proc_pids {program} [pidfile]
+# Set $pid to pids from /var/run* for {program}.  $pid should be declared
+# local in the caller.
+# Returns LSB exit code for the 'status' action.
+__pids_var_run() {
+        local base=${1##*/}
+        local pid_file=${2:-/var/run/$base.pid}
+
+        pid=
+        if [ -f "$pid_file" ] ; then
+                local line p
+
+                [ ! -r "$pid_file" ] && return 4 # "user had insufficient privilege"
+                while : ; do
+                        read line
+                        [ -z "$line" ] && break
+                        for p in $line ; do
+                                [ -z "${p//[0-9]/}" ] && [ -d "/proc/$p" ] && pid="$pid $p"
+                        done
+                done < "$pid_file"
+
+                if [ -n "$pid" ]; then
+                        return 0
+                fi
+                return 1 # "Program is dead and /var/run pid file exists"
+        fi
+        return 3 # "Program is not running"
+}
+
+# Output PIDs of matching processes, found using pidof
+__pids_pidof() {
+        pidof -c -o $$ -o $PPID -o %PPID -x "$1" || \
+                pidof -c -o $$ -o $PPID -o %PPID -x "${1##*/}"
+}
+
+
+# A function to find the pid of a program.
+pidofproc() {
+        local RC pid pid_file=
+
+        # Test syntax.
+        if [ "$#" = 0 ]; then
+                echo $"Usage: pidofproc [-p pidfile] {program}"
+                return 1
+        fi
+        if [ "$1" = "-p" ]; then
+                pid_file=$2
+                shift 2
+        fi
+        fail_code=3 # "Program is not running"
+
+        # First try "/var/run/*.pid" files
+        __pids_var_run "$1" "$pid_file"
+        RC=$?
+        if [ -n "$pid" ]; then
+                echo $pid
+                return 0
+        fi
+
+        [ -n "$pid_file" ] && return $RC
+        __pids_pidof "$1" || return $RC
+}
+
+
+
+# command prompt menu
+usage(){
+  local progname=$0
+  echo "$NAME - $DESCRIPTION
+Written by Ugo Viti <ugo.viti@initzero.it>
+version: $VERSION released: $VERSION_DATE
+
+usage: $progname [options]
+
+Option:  Argument:          Description:
+-----------------------------------------------
+  -g     <gateways>         gateways list separated by spaces (format: \"eth0:10.0.0.254 eth1:10.1.1.254 eth2:10.2.2.254\")
+  -v     <address>          host name or ip address of host used for ping reachability (default: $VERIFY_HOSTS)
+  -f     <address>          host name or ip address of host used for ping reachability when in failover mode (default: $FAILOVER_HOSTS)
+  -m     <mail address>     mail address where send status change notification (default: $MAILTO)
+  -t     <seconds>          sleep time between checks (default: $SLEEP_TIME seconds)
+  -p     <seconds>          ping timeout of hosts checks (default: $PING_TIMEOUT seconds)
+  -S     <number>           number of success pings before consider the link good (default: $SUCCESS_CNT cycles)
+  -E     <number>           number of failed pings before consider the link down (default: $ERROR_CNT cycles)
+  -F     <number>           number of failed pings before retry failover of an already down link (default: $FAILOVER_CNT cycles)
+  -l     <path>             directory path of the izping log file (default: $LOG)
+  -d       	            start izping in daemon mode (background)
+  -k       	            stop a running izping daemon
+  -r       	            restart a running izping daemon
+  -D       	            enable verbose output (display OK status messages)
+  -h                        display this help menu
+  -V                        display current version
+
+example: $progname -g \"eth0:172.16.1.254 eth1:10.1.1.1\""
+}
+
+
+###################################################################
+#################### default program menu and arguments validations
+NO_ARGS=0
+_OPTERROR=65
+command="$0"
+command_args="$@"
+
+if [ $# -eq "$NO_ARGS" ]  # Script invoked with no command-line args?
+then
+  usage
+  exit $E_OPTERROR        # Exit and explain usage, if no argument(s) given.
+fi
+# Usage: scriptname -options
+# Note: dash (-) necessary
+
+# SystemV init script args management
+case $1 in
+    stop)
+	DAEMON="1"
+	DAEMON_KILL="1"
+        ;;
+    start)
+        DAEMON="1"
+        ;;
+    restart)
+        DAEMON="1"
+	DAEMON_RESTART="1"
+        ;;
+    status)
+	status_daemon
+	exit $?
+        ;;
+esac
+
+# command line args management
+while getopts ":g:v:f:m:t:p:S:E:F:l:dkrDhV" option
+# Initial declaration.
+# a, b, c, d, e, f, and g are the options (flags) expected.
+# The : after option 'e' shows it will have an argument passed with it.
+do
+  case $option in
+    g ) GATEWAYS="${OPTARG}" ;;
+    v ) VERIFY_HOSTS="${OPTARG}" ;;
+    f ) FAILOVER_HOSTS="${OPTARG}" ;;
+    m ) MAILTO="${OPTARG}" ;;
+    t ) SLEEP_TIME="${OPTARG}" ;;
+    p ) PING_TIME="${OPTARG}" ;;
+    S ) SUCCESS_CNT="${OPTARG}" ;;
+    E ) ERROR_CNT="${OPTARG}" ;;
+    F ) FAILOVER_CNT="${OPTARG}" ;;
+    l ) LOG="${OPTARG}" ;;
+    d ) DAEMON="1" ;;
+    k ) DAEMON="1" ; DAEMON_KILL="1" ;;
+    r ) DAEMON="1" ; DAEMON_RESTART="1" ;;
+    D ) DEBUG="1" ;;
+    h ) usage ; exit 0 ;;
+    V ) #echo $NAME version: $VERSION released: $VERSION_DATE ; exit 0 ;;
+        echo $VERSION ; exit 0 ;;
+    * ) usage
+        echo "invalid switch specified - abort." >&2
+        exit 1 ;;
+  esac
+done
+# Move argument pointer to next.
+shift $(($OPTIND - 1))
+
+# kill the daemon
+[ $DAEMON_KILL -eq 1 ] && kill_daemon && exit 0
+
+# check if no args are given
+[ -z "${GATEWAYS}" ] && echo "ERROR: no GATEWAYS interface name and IP address specified, use the -g switch - abort." >&2 && exit 1
+
+
+if [ $DAEMON -ne 1 ]
+  then
+	#echo running in foreground mode
+	status_daemon
+	[[ ! -z "$PID" ]] && exit 0
+        izping_main
+  else
+        #echo running in background mode
+	if [ $DAEMON_RESTART -ne 1 ]
+	  then
+	    if [ $DAEMON_KILL -ne 1 ]
+              then
+	        start_daemon
+	      else
+		kill_daemon
+            fi
+	  else
+	    kill_daemon
+            start_daemon
+	fi
+fi
+}
+
+izping_run "$@"
+
+## The End
+###############################################################################################
+
+
+# License:
+# ----------------------------------------------------------------------------
+# Written by: Ugo Viti <ugo.viti@initzero.it>
+# visit http://www.initzero.it for commercial support
+# 
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# ----------------------------------------------------------------------------
+
+# What is this?
+# =============
+# izPing is a Multihomed Internet links tester, failover and recovery bash script for network balanced setups.
+# When called from izBalancing it automate the process of failover and recovery of connected Internet lines.
+
+# Usage:
+# =============
+# This script should not run standalone, but must be called from izbalancing script
+ 
+# Requirements:
+# =============
+# - GNU/Linux Firewall running Kernel >=2.6.10 (with iptables module CONNMARK available)
+# - Bash Shell >= 2.0
+# - Standard GNU/Linux coreutils utilities (cat, echo, grep, if, etc...)
+# - GNU Version of awk and sed utilities
+# - GNU/Linux Netfilter user space utilities (iptables >= 1.2.11)
+# - iproute2 utilities
+# - Two or more Internet connections
+# - An ethernet card for each ISP Router
+# - izBalancing configured and running (http://www.initzero.it/products/opensource/izbalancing)
+
+# Installation:
+# =============
+# 1) Download and configure izbalancing
+# 2) copy the izping script into /etc/rc./init.d/ and run:
+#    chmod 755 /etc/rc./init.d/izping
+#    chkconfig izping off
+# 3) edit the configuration variables inside izping script. Generally is needed to customize only MAILTO variable
+# 4) configure and start izbalancing, izping should start inside izbalancing
+# 5) look into logs if izping is running: tail -f /var/log/izping.log
+
+
+# Changelog:
+# =====================
+
+# 2014-08-19 - 1.6
+# - add "conntrack -F" command to FAILOVER and RECOVERY function
+
+# 2013-10-05 - 1.5
+# - check if another izping process is running before launch a new session
+# - changed the default ping timeout from 4 to 5 seconds
+# - changed the default ping count from 1 to 3 to avoid false positivies of unreachable hosts
+
+# 2013-08-27 - 1.4
+# - log current version into izping startup
+
+# 2013-05-25 - 1.3
+# - auto obtain the line number of the iptables rule to change when doing failover/recovery (not more hard coded to 2)
+
+# 2013-01-24 - 1.2
+# - added SystemV initscript args management (start|stop|restart|status)
+# - fixed management of IP configured via "ip" command instead ifconfig
+# - added more descriptive names of interfaces into logs and email reports
+
+# 2012-10-14 - 1.1
+# - first public release
+
+
+# 2012-09-04 - 1.0
+# - first internal release
+
