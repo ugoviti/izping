@@ -1,4 +1,5 @@
 # izPing
+Author: Ugo Viti <ugo.viti@initzero.it>
 
 ## What is this?
 izPing is a Multihomed Internet links tester, failover and recovery bash script for network balanced setups.
