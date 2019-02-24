@@ -1,7 +1,7 @@
 #!/bin/bash
 # description: izPing is a multihomed internet links tester, failover and recovery for network balanced setups
 # chkconfig: 35 99 9
-#
+
 # written by Ugo Viti <ugo.viti@initzero.it>
 # please visit http://www.initzero.it for commercial support
 # For README, HowTo, ChangeLog, Contributors and License go to the end of this script
@@ -13,7 +13,7 @@ izping_run() {
 # begin user variables
 
 # example of GATEWAY variable contents
-#GATEWAYS="eth1:192.168.56.3:internet1 eth2:192.168.57.3:internet2"
+#GATEWAYS="eth1:10.0.1.1:wan1 eth2:10.0.2.1:wan2"
 
 # ip address or hostname to ping to understand when a line is down (use spaces to separe the gateway to use, and comma to specify multiple target for every gateway)
 #VERIFY_HOSTS="8.8.8.8,www.initzero.it 8.8.4.4,www.google.com"
